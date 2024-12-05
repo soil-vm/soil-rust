@@ -1,4 +1,4 @@
-use crate::{Instruction, Label, Reg, Section, SectionKind, SoilBinary};
+use crate::{Instruction, InstructionKind, Label, Reg, Section, SectionKind, SoilBinary};
 
 #[derive(Debug)]
 pub enum ParseError {
@@ -49,32 +49,35 @@ impl Parser {
                 let limit = self.cursor + len as usize;
                 while self.cursor < limit {
                     let offset = self.cursor - sec_offset;
-                    instrs.push(self.parse_instr()?);
+                    instrs.push(Instruction {
+                        location: offset,
+                        kind: self.parse_instr()?,
+                    });
                     instr_offsets.push(offset);
                 }
-                for instr in instrs.iter_mut() {
-                    match instr {
-                        Instruction::Jump(ref mut target)
-                        | Instruction::Cjump(ref mut target)
-                        | Instruction::Call(ref mut target) => {
-                            let idx = instr_offsets
-                                .iter()
-                                .enumerate()
-                                .find_map(
-                                    |(idx, offset)| {
-                                        if offset == target {
-                                            Some(idx)
-                                        } else {
-                                            None
-                                        }
-                                    },
-                                )
-                                .unwrap();
-                            *target = idx;
-                        }
-                        _ => {}
-                    }
-                }
+                // for instr in instrs.iter_mut() {
+                //     match instr.kind {
+                //         InstructionKind::Jump(ref mut target)
+                //         | InstructionKind::Cjump(ref mut target)
+                //         | InstructionKind::Call(ref mut target) => {
+                //             let idx = instr_offsets
+                //                 .iter()
+                //                 .enumerate()
+                //                 .find_map(
+                //                     |(idx, offset)| {
+                //                         if offset == target {
+                //                             Some(idx)
+                //                         } else {
+                //                             None
+                //                         }
+                //                     },
+                //                 )
+                //                 .unwrap();
+                //             *target = idx;
+                //         }
+                //         _ => {}
+                //     }
+                // }
                 Ok(Section::Bytecode(instrs))
             }
             SectionKind::InitialMemory => {
@@ -121,113 +124,113 @@ impl Parser {
         Ok((Reg::try_from(0x0f & regs)?, Reg::try_from(regs >> 4)?))
     }
 
-    fn parse_instr(&mut self) -> Result<Instruction, ParseError> {
+    fn parse_instr(&mut self) -> Result<InstructionKind, ParseError> {
         let opcode = self.eat_byte();
         match opcode {
-            0x00 => Ok(Instruction::Nop),
-            0xe0 => Ok(Instruction::Panic),
-            0xe1 => Ok(Instruction::TryStart(self.eat_word())),
-            0xe2 => Ok(Instruction::TryEnd),
+            0x00 => Ok(InstructionKind::Nop),
+            0xe0 => Ok(InstructionKind::Panic),
+            0xe1 => Ok(InstructionKind::TryStart(self.eat_word())),
+            0xe2 => Ok(InstructionKind::TryEnd),
             0xd0 => {
                 let (r1, r2) = self.parse_two_regs()?;
-                Ok(Instruction::Move(r1, r2))
+                Ok(InstructionKind::Move(r1, r2))
             }
-            0xd1 => Ok(Instruction::Movei(self.parse_reg()?, self.eat_word())),
-            0xd2 => Ok(Instruction::Moveib(self.parse_reg()?, self.eat_byte())),
+            0xd1 => Ok(InstructionKind::Movei(self.parse_reg()?, self.eat_word())),
+            0xd2 => Ok(InstructionKind::Moveib(self.parse_reg()?, self.eat_byte())),
             0xd3 => {
                 let (r1, r2) = self.parse_two_regs()?;
-                Ok(Instruction::Load(r1, r2))
+                Ok(InstructionKind::Load(r1, r2))
             }
             0xd4 => {
                 let (r1, r2) = self.parse_two_regs()?;
-                Ok(Instruction::Loadb(r1, r2))
+                Ok(InstructionKind::Loadb(r1, r2))
             }
             0xd5 => {
                 let (r1, r2) = self.parse_two_regs()?;
-                Ok(Instruction::Store(r1, r2))
+                Ok(InstructionKind::Store(r1, r2))
             }
             0xd6 => {
                 let (r1, r2) = self.parse_two_regs()?;
-                Ok(Instruction::Storeb(r1, r2))
+                Ok(InstructionKind::Storeb(r1, r2))
             }
-            0xd7 => Ok(Instruction::Push(self.parse_reg()?)),
-            0xd8 => Ok(Instruction::Pop(self.parse_reg()?)),
-            0xf0 => Ok(Instruction::Jump(self.eat_word() as usize)),
-            0xf1 => Ok(Instruction::Cjump(self.eat_word() as usize)),
-            0xf2 => Ok(Instruction::Call(self.eat_word() as usize)),
-            0xf3 => Ok(Instruction::Ret),
-            0xf4 => Ok(Instruction::Syscall(self.eat_byte())),
+            0xd7 => Ok(InstructionKind::Push(self.parse_reg()?)),
+            0xd8 => Ok(InstructionKind::Pop(self.parse_reg()?)),
+            0xf0 => Ok(InstructionKind::Jump(self.eat_word() as usize)),
+            0xf1 => Ok(InstructionKind::Cjump(self.eat_word() as usize)),
+            0xf2 => Ok(InstructionKind::Call(self.eat_word() as usize)),
+            0xf3 => Ok(InstructionKind::Ret),
+            0xf4 => Ok(InstructionKind::Syscall(self.eat_byte())),
             0xc0 => {
                 let (r1, r2) = self.parse_two_regs()?;
-                Ok(Instruction::Cmp(r1, r2))
+                Ok(InstructionKind::Cmp(r1, r2))
             }
-            0xc1 => Ok(Instruction::Isequal),
-            0xc2 => Ok(Instruction::Isless),
-            0xc3 => Ok(Instruction::Isgreater),
-            0xc4 => Ok(Instruction::Islessequal),
-            0xc5 => Ok(Instruction::Isgreaterequal),
-            0xc6 => Ok(Instruction::Isnotequal),
+            0xc1 => Ok(InstructionKind::Isequal),
+            0xc2 => Ok(InstructionKind::Isless),
+            0xc3 => Ok(InstructionKind::Isgreater),
+            0xc4 => Ok(InstructionKind::Islessequal),
+            0xc5 => Ok(InstructionKind::Isgreaterequal),
+            0xc6 => Ok(InstructionKind::Isnotequal),
             0xc7 => {
                 let (r1, r2) = self.parse_two_regs()?;
-                Ok(Instruction::Fcmp(r1, r2))
+                Ok(InstructionKind::Fcmp(r1, r2))
             }
-            0xc8 => Ok(Instruction::Fisequal),
-            0xc9 => Ok(Instruction::Fisless),
-            0xca => Ok(Instruction::Fisgreater),
-            0xcb => Ok(Instruction::Fislessequal),
-            0xcc => Ok(Instruction::Fisgreaterequal),
-            0xcd => Ok(Instruction::Fisnotequal),
-            0xce => Ok(Instruction::IntToFloat(self.parse_reg()?)),
-            0xcf => Ok(Instruction::FloatToInt(self.parse_reg()?)),
+            0xc8 => Ok(InstructionKind::Fisequal),
+            0xc9 => Ok(InstructionKind::Fisless),
+            0xca => Ok(InstructionKind::Fisgreater),
+            0xcb => Ok(InstructionKind::Fislessequal),
+            0xcc => Ok(InstructionKind::Fisgreaterequal),
+            0xcd => Ok(InstructionKind::Fisnotequal),
+            0xce => Ok(InstructionKind::IntToFloat(self.parse_reg()?)),
+            0xcf => Ok(InstructionKind::FloatToInt(self.parse_reg()?)),
             0xa0 => {
                 let (r1, r2) = self.parse_two_regs()?;
-                Ok(Instruction::Add(r1, r2))
+                Ok(InstructionKind::Add(r1, r2))
             }
             0xa1 => {
                 let (r1, r2) = self.parse_two_regs()?;
-                Ok(Instruction::Sub(r1, r2))
+                Ok(InstructionKind::Sub(r1, r2))
             }
             0xa2 => {
                 let (r1, r2) = self.parse_two_regs()?;
-                Ok(Instruction::Mul(r1, r2))
+                Ok(InstructionKind::Mul(r1, r2))
             }
             0xa3 => {
                 let (r1, r2) = self.parse_two_regs()?;
-                Ok(Instruction::Div(r1, r2))
+                Ok(InstructionKind::Div(r1, r2))
             }
             0xa4 => {
                 let (r1, r2) = self.parse_two_regs()?;
-                Ok(Instruction::Rem(r1, r2))
+                Ok(InstructionKind::Rem(r1, r2))
             }
             0xa5 => {
                 let (r1, r2) = self.parse_two_regs()?;
-                Ok(Instruction::Fadd(r1, r2))
+                Ok(InstructionKind::Fadd(r1, r2))
             }
             0xa6 => {
                 let (r1, r2) = self.parse_two_regs()?;
-                Ok(Instruction::Fsub(r1, r2))
+                Ok(InstructionKind::Fsub(r1, r2))
             }
             0xa7 => {
                 let (r1, r2) = self.parse_two_regs()?;
-                Ok(Instruction::Fmul(r1, r2))
+                Ok(InstructionKind::Fmul(r1, r2))
             }
             0xa8 => {
                 let (r1, r2) = self.parse_two_regs()?;
-                Ok(Instruction::Fdiv(r1, r2))
+                Ok(InstructionKind::Fdiv(r1, r2))
             }
             0xb0 => {
                 let (r1, r2) = self.parse_two_regs()?;
-                Ok(Instruction::And(r1, r2))
+                Ok(InstructionKind::And(r1, r2))
             }
             0xb1 => {
                 let (r1, r2) = self.parse_two_regs()?;
-                Ok(Instruction::Or(r1, r2))
+                Ok(InstructionKind::Or(r1, r2))
             }
             0xb2 => {
                 let (r1, r2) = self.parse_two_regs()?;
-                Ok(Instruction::Xor(r1, r2))
+                Ok(InstructionKind::Xor(r1, r2))
             }
-            0xb3 => Ok(Instruction::Negate(self.parse_reg()?)),
+            0xb3 => Ok(InstructionKind::Negate(self.parse_reg()?)),
             o => Err(ParseError::BadOpcode(o)),
         }
     }

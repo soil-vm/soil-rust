@@ -1,20 +1,48 @@
-use std::ops::Neg;
+pub mod syscalls;
 
-use soil::{Instruction, Reg, SoilBinary};
+use std::{collections::HashSet, ops::Neg};
+
+use soil::{Instruction, InstructionKind, Reg, SoilBinary};
+use syscalls::{DefaultSyscalls, SyscallHandler};
 
 const VM_MEM_SIZE: usize = 1000000;
 
 pub enum ControlFlow {
     Continue,
+    Breakpoint,
     Jump(usize),
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum Trap {
-    Panic,
+    Panic(String),
     CallStackEmpty,
     FloatException,
     UnknownSyscall(u8),
+    Exited,
+    IllegalJump,
+    Breakpoint,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct Register([u8; 8]);
+
+impl Register {
+    pub fn read_int(&self) -> i64 {
+        i64::from_le_bytes(self.0)
+    }
+
+    pub fn read_float(&self) -> f64 {
+        f64::from_le_bytes(self.0)
+    }
+
+    pub fn write_int(&mut self, value: i64) {
+        self.0.copy_from_slice(&value.to_le_bytes())
+    }
+
+    pub fn write_float(&mut self, value: f64) {
+        self.0.copy_from_slice(&value.to_le_bytes())
+    }
 }
 
 pub struct TryFrame {
@@ -23,45 +51,59 @@ pub struct TryFrame {
     catch: i64,
 }
 
-pub struct Vm {
+pub struct Vm<S: SyscallHandler> {
     memory: Vec<u8>,
-    registers: [[u8; 8]; 8],
+    registers: [Register; 8],
     ip: usize,
     try_stack: Vec<TryFrame>,
     call_stack: Vec<usize>,
     bytecode: SoilBinary,
+    syscalls: S,
+    breakpoints: HashSet<usize>,
     dbg_instrs: bool,
 }
 
-impl Vm {
+impl Vm<DefaultSyscalls> {
     pub fn new(bytecode: SoilBinary, dbg_instrs: bool) -> Self {
+        Self::with_syscalls(bytecode, DefaultSyscalls, dbg_instrs)
+    }
+}
+
+impl<S: SyscallHandler> Vm<S> {
+    pub fn with_syscalls(bytecode: SoilBinary, syscalls: S, dbg_instrs: bool) -> Self {
         let mut vm = Vm {
             memory: Vec::with_capacity(VM_MEM_SIZE),
-            registers: [[0; 8]; 8],
+            registers: [Register::default(); 8],
             ip: 0,
             try_stack: vec![],
             call_stack: vec![],
             bytecode,
+            syscalls,
+            breakpoints: HashSet::default(),
             dbg_instrs,
         };
         vm.write_reg(Reg::SP, VM_MEM_SIZE as i64);
         vm
     }
 
+    pub fn ip(&self) -> usize {
+        self.ip
+    }
+
     fn read_reg(&self, reg: Reg) -> i64 {
-        i64::from_le_bytes(self.registers[reg as usize])
+        self.registers[reg as usize].read_int()
     }
 
     fn readf_reg(&self, reg: Reg) -> f64 {
-        f64::from_le_bytes(self.registers[reg as usize])
+        self.registers[reg as usize].read_float()
     }
 
     fn writef_reg(&mut self, reg: Reg, value: f64) {
-        self.registers[reg as usize].copy_from_slice(&value.to_le_bytes())
+        self.registers[reg as usize].write_float(value);
     }
 
     fn write_reg(&mut self, reg: Reg, value: i64) {
-        self.registers[reg as usize].copy_from_slice(&value.to_le_bytes());
+        self.registers[reg as usize].write_int(value);
     }
 
     fn read_mem(&self, addr: i64) -> u8 {
@@ -87,13 +129,12 @@ impl Vm {
         self.memory[addr..addr + std::mem::size_of::<i64>()].copy_from_slice(&value.to_le_bytes())
     }
 
-    fn handle_syscall(&mut self, nr: u8) -> Result<(), Trap> {
-        match nr {
-            0 => {
-                std::process::exit(self.read_reg(Reg::A) as i32);
-            }
-            _ => Err(Trap::UnknownSyscall(nr)),
+    pub fn format_status(&self) -> String {
+        let mut s = format!("IP = {:02};\t", self.ip);
+        for reg in soil::REGS {
+            s = format!("{s}{reg:?} = {};\t", self.read_reg(reg));
         }
+        s
     }
 
     fn print_registers(&self) {
@@ -105,7 +146,11 @@ impl Vm {
     }
 
     pub fn run(&mut self) -> Result<(), Trap> {
-        let bytecode = self.bytecode.bytecode().ok_or(Trap::Panic)?.to_vec();
+        let bytecode = self
+            .bytecode
+            .bytecode()
+            .ok_or(Trap::Panic("Invalid binary".to_string()))?
+            .to_vec();
         while self.ip < bytecode.len() {
             if self.dbg_instrs {
                 print!("{:x};\t", bytecode[self.ip].opcode());
@@ -114,6 +159,7 @@ impl Vm {
             match res {
                 ControlFlow::Continue => self.ip += 1,
                 ControlFlow::Jump(target) => self.ip = target,
+                ControlFlow::Breakpoint => {}
             }
             if self.dbg_instrs {
                 self.print_registers();
@@ -122,202 +168,263 @@ impl Vm {
         Ok(())
     }
 
+    fn find_jump_target(&self, target: usize) -> Option<usize> {
+        self.bytecode
+            .bytecode()?
+            .iter()
+            .enumerate()
+            .find_map(|(idx, i)| {
+                if i.location == target {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+    }
+
+    pub fn set_breakpoint(&mut self, target: usize) {
+        self.breakpoints.insert(target);
+    }
+
+    pub fn unset_breakpoint(&mut self, target: usize) {
+        self.breakpoints.remove(&target);
+    }
+
+    pub fn step(&mut self) -> Result<(), Trap> {
+        let bytecode = self
+            .bytecode
+            .bytecode()
+            .ok_or(Trap::Panic("Invalid binary".to_string()))?;
+        if self.ip >= bytecode.len() {
+            return Err(Trap::Panic("Reached end of bytecode".to_string()));
+        }
+        let res = self.run_instruction(bytecode[self.ip])?;
+
+        match res {
+            ControlFlow::Continue => self.ip += 1,
+            ControlFlow::Breakpoint => {
+                self.ip += 1;
+                return Err(Trap::Breakpoint);
+            }
+            ControlFlow::Jump(target) => self.ip = target,
+        }
+        Ok(())
+    }
+
     fn run_instruction(&mut self, instr: Instruction) -> Result<ControlFlow, Trap> {
-        match instr {
-            Instruction::Nop => {}
-            Instruction::Panic => match self.try_stack.pop() {
+        if self.breakpoints.contains(&instr.location) {
+            return Ok(ControlFlow::Breakpoint);
+        }
+        match instr.kind {
+            InstructionKind::Nop => {}
+            InstructionKind::Panic => match self.try_stack.pop() {
                 Some(frame) => {
                     self.write_reg(Reg::SP, frame.sp);
                     self.call_stack.truncate(frame.call_stack_size);
                     return Ok(ControlFlow::Jump(frame.catch as usize));
                 }
-                None => return Err(Trap::Panic),
+                None => return Err(Trap::Panic("VM panicked".to_string())),
             },
-            Instruction::TryStart(catch) => self.try_stack.push(TryFrame {
+            InstructionKind::TryStart(catch) => self.try_stack.push(TryFrame {
                 sp: self.read_reg(Reg::SP),
                 call_stack_size: self.call_stack.len(),
                 catch,
             }),
-            Instruction::TryEnd => {
+            InstructionKind::TryEnd => {
                 self.try_stack.pop();
             }
-            Instruction::Move(r1, r2) => {
+            InstructionKind::Move(r1, r2) => {
                 self.write_reg(r1, self.read_reg(r2));
             }
-            Instruction::Movei(r, w) => {
+            InstructionKind::Movei(r, w) => {
                 self.write_reg(r, w);
             }
-            Instruction::Moveib(r, b) => {
+            InstructionKind::Moveib(r, b) => {
                 self.write_reg(r, b as i64);
             }
-            Instruction::Load(r1, r2) => {
+            InstructionKind::Load(r1, r2) => {
                 self.write_reg(r1, self.read_mem_word(self.read_reg(r2)));
             }
-            Instruction::Loadb(r1, r2) => {
+            InstructionKind::Loadb(r1, r2) => {
                 self.write_reg(r1, self.read_mem(self.read_reg(r2)).into());
             }
-            Instruction::Store(r1, r2) => {
+            InstructionKind::Store(r1, r2) => {
                 self.write_mem_word(self.read_reg(r1), self.read_mem_word(self.read_reg(r2)));
             }
-            Instruction::Storeb(r1, r2) => {
+            InstructionKind::Storeb(r1, r2) => {
                 self.write_mem(self.read_reg(r1), self.read_mem(self.read_reg(r2)));
             }
-            Instruction::Push(r) => {
+            InstructionKind::Push(r) => {
                 self.write_reg(Reg::SP, self.read_reg(Reg::SP) - 8);
                 self.write_mem_word(self.read_reg(Reg::SP), self.read_mem_word(self.read_reg(r)));
             }
-            Instruction::Pop(r) => {
+            InstructionKind::Pop(r) => {
                 self.write_reg(r, self.read_mem_word(self.read_reg(r)));
                 self.write_reg(Reg::SP, self.read_reg(Reg::SP) + 8);
             }
-            Instruction::Jump(target) => return Ok(ControlFlow::Jump(target)),
-            Instruction::Cjump(target) => {
+            InstructionKind::Jump(target) => {
+                return Ok(ControlFlow::Jump(
+                    self.find_jump_target(target).ok_or(Trap::IllegalJump)?,
+                ));
+            }
+            InstructionKind::Cjump(target) => {
                 if self.read_reg(Reg::ST) != 0 {
-                    return Ok(ControlFlow::Jump(target));
+                    return Ok(ControlFlow::Jump(
+                        self.find_jump_target(target).ok_or(Trap::IllegalJump)?,
+                    ));
                 }
             }
-            Instruction::Call(target) => {
+            InstructionKind::Call(target) => {
                 self.call_stack.push(self.ip);
-                return Ok(ControlFlow::Jump(target));
+                return Ok(ControlFlow::Jump(
+                    self.find_jump_target(target).ok_or(Trap::IllegalJump)?,
+                ));
             }
-            Instruction::Ret => match self.call_stack.pop() {
+            InstructionKind::Ret => match self.call_stack.pop() {
                 Some(target) => self.ip = target,
                 None => return Err(Trap::CallStackEmpty),
             },
-            Instruction::Syscall(num) => self.handle_syscall(num)?,
-            Instruction::Cmp(r1, r2) => {
+            InstructionKind::Syscall(num) => {
+                self.syscalls.handle_syscall(
+                    num,
+                    &mut self.registers,
+                    &mut self.memory,
+                    &mut self.ip,
+                )?;
+            }
+            InstructionKind::Cmp(r1, r2) => {
                 self.write_reg(Reg::ST, self.read_reg(r1) - self.read_reg(r2));
             }
-            Instruction::Isequal => {
+            InstructionKind::Isequal => {
                 if self.read_reg(Reg::ST) == 0 {
                     self.write_reg(Reg::ST, 1);
                 } else {
                     self.write_reg(Reg::ST, 0);
                 }
             }
-            Instruction::Isless => {
+            InstructionKind::Isless => {
                 if self.read_reg(Reg::ST) < 0 {
                     self.write_reg(Reg::ST, 1);
                 } else {
                     self.write_reg(Reg::ST, 0);
                 }
             }
-            Instruction::Isgreater => {
+            InstructionKind::Isgreater => {
                 if self.read_reg(Reg::ST) > 0 {
                     self.write_reg(Reg::ST, 1);
                 } else {
                     self.write_reg(Reg::ST, 0);
                 }
             }
-            Instruction::Islessequal => {
+            InstructionKind::Islessequal => {
                 if self.read_reg(Reg::ST) <= 0 {
                     self.write_reg(Reg::ST, 1);
                 } else {
                     self.write_reg(Reg::ST, 0);
                 }
             }
-            Instruction::Isgreaterequal => {
+            InstructionKind::Isgreaterequal => {
                 if self.read_reg(Reg::ST) >= 0 {
                     self.write_reg(Reg::ST, 1);
                 } else {
                     self.write_reg(Reg::ST, 0);
                 }
             }
-            Instruction::Isnotequal => {
+            InstructionKind::Isnotequal => {
                 if self.read_reg(Reg::ST) != 0 {
                     self.write_reg(Reg::ST, 1);
                 } else {
                     self.write_reg(Reg::ST, 0);
                 }
             }
-            Instruction::Fcmp(r1, r2) => {
+            InstructionKind::Fcmp(r1, r2) => {
                 self.writef_reg(Reg::ST, self.readf_reg(r1) - self.readf_reg(r2))
             }
-            Instruction::Fisequal => {
+            InstructionKind::Fisequal => {
                 if self.readf_reg(Reg::ST) == 0.0 {
                     self.write_reg(Reg::ST, 1);
                 } else {
                     self.write_reg(Reg::ST, 0);
                 }
             }
-            Instruction::Fisless => {
+            InstructionKind::Fisless => {
                 if self.readf_reg(Reg::ST) < 0.0 {
                     self.write_reg(Reg::ST, 1);
                 } else {
                     self.write_reg(Reg::ST, 0);
                 }
             }
-            Instruction::Fisgreater => {
+            InstructionKind::Fisgreater => {
                 if self.readf_reg(Reg::ST) > 0.0 {
                     self.write_reg(Reg::ST, 1);
                 } else {
                     self.write_reg(Reg::ST, 0);
                 }
             }
-            Instruction::Fislessequal => {
+            InstructionKind::Fislessequal => {
                 if self.readf_reg(Reg::ST) <= 0.0 {
                     self.write_reg(Reg::ST, 1);
                 } else {
                     self.write_reg(Reg::ST, 0);
                 }
             }
-            Instruction::Fisgreaterequal => {
+            InstructionKind::Fisgreaterequal => {
                 if self.readf_reg(Reg::ST) >= 0.0 {
                     self.write_reg(Reg::ST, 1);
                 } else {
                     self.write_reg(Reg::ST, 0);
                 }
             }
-            Instruction::Fisnotequal => {
+            InstructionKind::Fisnotequal => {
                 if self.readf_reg(Reg::ST) != 0.0 {
                     self.write_reg(Reg::ST, 1);
                 } else {
                     self.write_reg(Reg::ST, 0);
                 }
             }
-            Instruction::IntToFloat(r) => {
+            InstructionKind::IntToFloat(r) => {
                 self.writef_reg(r, self.read_reg(r) as f64);
             }
-            Instruction::FloatToInt(r) => {
+            InstructionKind::FloatToInt(r) => {
                 self.write_reg(r, self.readf_reg(r) as i64);
             }
-            Instruction::Add(r1, r2) => {
+            InstructionKind::Add(r1, r2) => {
                 self.write_reg(r1, self.read_reg(r1) + self.read_reg(r2));
             }
-            Instruction::Sub(r1, r2) => {
+            InstructionKind::Sub(r1, r2) => {
                 self.write_reg(r1, self.read_reg(r1) - self.read_reg(r2));
             }
-            Instruction::Mul(r1, r2) => {
+            InstructionKind::Mul(r1, r2) => {
                 self.write_reg(r1, self.read_reg(r1) * self.read_reg(r2));
             }
-            Instruction::Div(r1, r2) => {
+            InstructionKind::Div(r1, r2) => {
                 self.write_reg(r1, self.read_reg(r1) / self.read_reg(r2));
             }
-            Instruction::Rem(r1, r2) => {
+            InstructionKind::Rem(r1, r2) => {
                 self.write_reg(r1, self.read_reg(r1) % self.read_reg(r2));
             }
-            Instruction::Fadd(r1, r2) => {
+            InstructionKind::Fadd(r1, r2) => {
                 self.writef_reg(r1, self.readf_reg(r1) + self.readf_reg(r2));
             }
-            Instruction::Fsub(r1, r2) => {
+            InstructionKind::Fsub(r1, r2) => {
                 self.writef_reg(r1, self.readf_reg(r1) - self.readf_reg(r2));
             }
-            Instruction::Fmul(r1, r2) => {
+            InstructionKind::Fmul(r1, r2) => {
                 self.writef_reg(r1, self.readf_reg(r1) * self.readf_reg(r2));
             }
-            Instruction::Fdiv(r1, r2) => {
+            InstructionKind::Fdiv(r1, r2) => {
                 self.writef_reg(r1, self.readf_reg(r1) / self.readf_reg(r2));
             }
-            Instruction::And(r1, r2) => {
+            InstructionKind::And(r1, r2) => {
                 self.write_reg(r1, self.read_reg(r1) & self.read_reg(r2));
             }
-            Instruction::Or(r1, r2) => {
+            InstructionKind::Or(r1, r2) => {
                 self.write_reg(r1, self.read_reg(r1) | self.read_reg(r2));
             }
-            Instruction::Xor(r1, r2) => {
+            InstructionKind::Xor(r1, r2) => {
                 self.write_reg(r1, self.read_reg(r1) ^ self.read_reg(r2));
             }
-            Instruction::Negate(r) => self.write_reg(r, self.read_reg(r).neg()),
+            InstructionKind::Negate(r) => self.write_reg(r, self.read_reg(r).neg()),
         }
         Ok(ControlFlow::Continue)
     }

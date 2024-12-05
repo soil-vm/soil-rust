@@ -2,7 +2,7 @@ use parse::ParseError;
 
 pub mod parse;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SoilBinary {
     sections: Vec<Section>,
 }
@@ -23,6 +23,13 @@ impl SoilBinary {
     pub fn bytecode(&self) -> Option<&[Instruction]> {
         self.sections.iter().find_map(|s| match s {
             Section::Bytecode(b) => Some(b.as_slice()),
+            _ => None,
+        })
+    }
+
+    pub fn labels(&self) -> Option<&[Label]> {
+        self.sections.iter().find_map(|s| match s {
+            Section::Labels(l) => Some(l.as_slice()),
             _ => None,
         })
     }
@@ -52,10 +59,10 @@ impl TryFrom<u8> for SectionKind {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Label {
-    position: usize,
-    name: String,
+    pub position: usize,
+    pub name: String,
 }
 
 impl Label {
@@ -72,7 +79,7 @@ impl Label {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[repr(u8)]
 pub enum Section {
     Bytecode(Vec<Instruction>) = 0,
@@ -89,6 +96,15 @@ impl Section {
 
     pub fn from_instructions(instructions: Vec<Instruction>) -> Self {
         Self::Bytecode(instructions)
+    }
+
+    pub fn from_instr_kinds(instructions: Vec<InstructionKind>) -> Self {
+        Self::Bytecode(
+            instructions
+                .into_iter()
+                .map(|i| Instruction::from_kind(i))
+                .collect(),
+        )
     }
 
     pub fn initial_memory(content: Vec<u8>) -> Self {
@@ -139,8 +155,14 @@ impl Section {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub struct Instruction {
+    pub location: usize,
+    pub kind: InstructionKind,
+}
+
+#[derive(Clone, Copy, Debug)]
 #[repr(u8)]
-pub enum Instruction {
+pub enum InstructionKind {
     Nop = 0x00,
     Panic = 0xe0,
     TryStart(i64) = 0xe1,
@@ -192,7 +214,7 @@ pub enum Instruction {
 
 impl Instruction {
     pub fn opcode(&self) -> u8 {
-        unsafe { *(self as *const _ as *const u8) }
+        unsafe { *(&self.kind as *const _ as *const u8) }
     }
 
     fn encode_regs(&self, r1: Reg, r2: Reg, bytes: &mut Vec<u8>) {
@@ -201,120 +223,124 @@ impl Instruction {
 
     pub fn serialize(&self) -> Vec<u8> {
         let mut bytes = vec![self.opcode()];
-        match self {
-            Instruction::Nop
-            | Instruction::Panic
-            | Instruction::TryEnd
-            | Instruction::Ret
-            | Instruction::Isequal
-            | Instruction::Isless
-            | Instruction::Isgreater
-            | Instruction::Islessequal
-            | Instruction::Isgreaterequal
-            | Instruction::Isnotequal
-            | Instruction::Fisequal
-            | Instruction::Fisless
-            | Instruction::Fisgreater
-            | Instruction::Fislessequal
-            | Instruction::Fisgreaterequal
-            | Instruction::Fisnotequal => {}
-            Instruction::TryStart(w) => {
+        match self.kind {
+            InstructionKind::Nop
+            | InstructionKind::Panic
+            | InstructionKind::TryEnd
+            | InstructionKind::Ret
+            | InstructionKind::Isequal
+            | InstructionKind::Isless
+            | InstructionKind::Isgreater
+            | InstructionKind::Islessequal
+            | InstructionKind::Isgreaterequal
+            | InstructionKind::Isnotequal
+            | InstructionKind::Fisequal
+            | InstructionKind::Fisless
+            | InstructionKind::Fisgreater
+            | InstructionKind::Fislessequal
+            | InstructionKind::Fisgreaterequal
+            | InstructionKind::Fisnotequal => {}
+            InstructionKind::TryStart(w) => {
                 bytes.extend_from_slice(&w.to_le_bytes());
             }
-            Instruction::Move(r1, r2) => {
-                self.encode_regs(*r1, *r2, &mut bytes);
+            InstructionKind::Move(r1, r2) => {
+                self.encode_regs(r1, r2, &mut bytes);
             }
-            Instruction::Movei(r, w) => {
-                bytes.push(*r as u8);
+            InstructionKind::Movei(r, w) => {
+                bytes.push(r as u8);
                 bytes.extend_from_slice(&w.to_le_bytes());
             }
-            Instruction::Moveib(r, b) => {
-                bytes.push(*r as u8);
-                bytes.push(*b);
+            InstructionKind::Moveib(r, b) => {
+                bytes.push(r as u8);
+                bytes.push(b);
             }
-            Instruction::Load(r1, r2) => {
-                self.encode_regs(*r1, *r2, &mut bytes);
+            InstructionKind::Load(r1, r2) => {
+                self.encode_regs(r1, r2, &mut bytes);
             }
-            Instruction::Loadb(r1, r2) => {
-                self.encode_regs(*r1, *r2, &mut bytes);
+            InstructionKind::Loadb(r1, r2) => {
+                self.encode_regs(r1, r2, &mut bytes);
             }
-            Instruction::Store(r1, r2) => {
-                self.encode_regs(*r1, *r2, &mut bytes);
+            InstructionKind::Store(r1, r2) => {
+                self.encode_regs(r1, r2, &mut bytes);
             }
-            Instruction::Storeb(r1, r2) => {
-                self.encode_regs(*r1, *r2, &mut bytes);
+            InstructionKind::Storeb(r1, r2) => {
+                self.encode_regs(r1, r2, &mut bytes);
             }
-            Instruction::Push(r) => {
-                bytes.push(*r as u8);
+            InstructionKind::Push(r) => {
+                bytes.push(r as u8);
             }
-            Instruction::Pop(r) => {
-                bytes.push(*r as u8);
+            InstructionKind::Pop(r) => {
+                bytes.push(r as u8);
             }
-            Instruction::Jump(w) => {
+            InstructionKind::Jump(w) => {
                 bytes.extend_from_slice(&w.to_le_bytes());
             }
-            Instruction::Cjump(w) => {
+            InstructionKind::Cjump(w) => {
                 bytes.extend_from_slice(&w.to_le_bytes());
             }
-            Instruction::Call(w) => {
+            InstructionKind::Call(w) => {
                 bytes.extend_from_slice(&w.to_le_bytes());
             }
-            Instruction::Syscall(b) => {
-                bytes.push(*b);
+            InstructionKind::Syscall(b) => {
+                bytes.push(b);
             }
-            Instruction::Cmp(r1, r2) => {
-                self.encode_regs(*r1, *r2, &mut bytes);
+            InstructionKind::Cmp(r1, r2) => {
+                self.encode_regs(r1, r2, &mut bytes);
             }
-            Instruction::Fcmp(r1, r2) => {
-                self.encode_regs(*r1, *r2, &mut bytes);
+            InstructionKind::Fcmp(r1, r2) => {
+                self.encode_regs(r1, r2, &mut bytes);
             }
-            Instruction::IntToFloat(r) => {
-                bytes.push(*r as u8);
+            InstructionKind::IntToFloat(r) => {
+                bytes.push(r as u8);
             }
-            Instruction::FloatToInt(r) => {
-                bytes.push(*r as u8);
+            InstructionKind::FloatToInt(r) => {
+                bytes.push(r as u8);
             }
-            Instruction::Add(r1, r2) => {
-                self.encode_regs(*r1, *r2, &mut bytes);
+            InstructionKind::Add(r1, r2) => {
+                self.encode_regs(r1, r2, &mut bytes);
             }
-            Instruction::Sub(r1, r2) => {
-                self.encode_regs(*r1, *r2, &mut bytes);
+            InstructionKind::Sub(r1, r2) => {
+                self.encode_regs(r1, r2, &mut bytes);
             }
-            Instruction::Mul(r1, r2) => {
-                self.encode_regs(*r1, *r2, &mut bytes);
+            InstructionKind::Mul(r1, r2) => {
+                self.encode_regs(r1, r2, &mut bytes);
             }
-            Instruction::Div(r1, r2) => {
-                self.encode_regs(*r1, *r2, &mut bytes);
+            InstructionKind::Div(r1, r2) => {
+                self.encode_regs(r1, r2, &mut bytes);
             }
-            Instruction::Rem(r1, r2) => {
-                self.encode_regs(*r1, *r2, &mut bytes);
+            InstructionKind::Rem(r1, r2) => {
+                self.encode_regs(r1, r2, &mut bytes);
             }
-            Instruction::Fadd(r1, r2) => {
-                self.encode_regs(*r1, *r2, &mut bytes);
+            InstructionKind::Fadd(r1, r2) => {
+                self.encode_regs(r1, r2, &mut bytes);
             }
-            Instruction::Fsub(r1, r2) => {
-                self.encode_regs(*r1, *r2, &mut bytes);
+            InstructionKind::Fsub(r1, r2) => {
+                self.encode_regs(r1, r2, &mut bytes);
             }
-            Instruction::Fmul(r1, r2) => {
-                self.encode_regs(*r1, *r2, &mut bytes);
+            InstructionKind::Fmul(r1, r2) => {
+                self.encode_regs(r1, r2, &mut bytes);
             }
-            Instruction::Fdiv(r1, r2) => {
-                self.encode_regs(*r1, *r2, &mut bytes);
+            InstructionKind::Fdiv(r1, r2) => {
+                self.encode_regs(r1, r2, &mut bytes);
             }
-            Instruction::And(r1, r2) => {
-                self.encode_regs(*r1, *r2, &mut bytes);
+            InstructionKind::And(r1, r2) => {
+                self.encode_regs(r1, r2, &mut bytes);
             }
-            Instruction::Or(r1, r2) => {
-                self.encode_regs(*r1, *r2, &mut bytes);
+            InstructionKind::Or(r1, r2) => {
+                self.encode_regs(r1, r2, &mut bytes);
             }
-            Instruction::Xor(r1, r2) => {
-                self.encode_regs(*r1, *r2, &mut bytes);
+            InstructionKind::Xor(r1, r2) => {
+                self.encode_regs(r1, r2, &mut bytes);
             }
-            Instruction::Negate(r) => {
-                bytes.push(*r as u8);
+            InstructionKind::Negate(r) => {
+                bytes.push(r as u8);
             }
         }
         bytes
+    }
+
+    fn from_kind(kind: InstructionKind) -> Instruction {
+        Self { location: 0, kind }
     }
 }
 
